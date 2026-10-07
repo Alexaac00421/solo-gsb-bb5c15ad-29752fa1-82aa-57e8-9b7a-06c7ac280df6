@@ -63,3 +63,29 @@ echo
 echo "7) 版本列表 / 指定版本规则集"
 curl -fsS "$BASE_URL/api/v1/versions"; echo
 curl -fsS "$BASE_URL/api/v1/versions/1" | head -c 600; echo
+
+echo
+echo "8) 发布预览：候选规则集 vs 基准版本 v1（逐样例对比，不写入、不消耗版本号）"
+curl -fsS -X POST "$BASE_URL/api/v1/preview" \
+  -H 'Content-Type: application/json' \
+  -d @"$(dirname "$0")/preview_request.json"; echo
+
+echo
+echo "9) 候选集冲突的预览（HTTP 409，整次拒绝，无样例结果）"
+curl -sS -o /tmp/preview_conflict.json -w 'HTTP %{http_code}\n' -X POST "$BASE_URL/api/v1/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "rules": [
+          {"business_key": "loan_approval", "region": "BJ", "category": "personal",
+           "valid_from": "2026-01-01T00:00:00Z", "valid_to": "2027-01-01T00:00:00Z",
+           "priority": 100, "conclusion": "approve"},
+          {"business_key": "loan_approval", "region": "BJ", "category": "personal",
+           "valid_from": "2026-06-01T00:00:00Z", "valid_to": "2026-12-31T00:00:00Z",
+           "priority": 100, "conclusion": "reject"}
+        ],
+        "samples": [
+          {"business_key": "loan_approval", "region": "BJ", "category": "personal",
+           "occurred_at": "2026-06-01T08:00:00Z"}
+        ]
+      }'
+cat /tmp/preview_conflict.json; echo

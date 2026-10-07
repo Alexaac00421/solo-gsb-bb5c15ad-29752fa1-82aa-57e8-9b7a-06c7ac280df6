@@ -64,12 +64,13 @@ class PublishRequest(BaseModel):
     rules: list[RuleIn] = Field(..., description="本次发布的完整规则集（全量）")
 
 
-class AdjudicateRequest(BaseModel):
+class AdjudicationSample(BaseModel):
+    """单个裁决样例：业务键 / 地区 / 类别 / 发生时刻。"""
+
     business_key: str = Field(..., description="业务键，非空字符串")
     region: str = Field(..., description="地区代码")
     category: str = Field(..., description="对象类别")
     occurred_at: datetime = Field(..., description="事件发生时刻")
-    version: Optional[int] = Field(None, description="可选版本；省略则取请求开始时最新版本")
 
     @field_validator("business_key", "region", "category")
     @classmethod
@@ -81,6 +82,15 @@ class AdjudicateRequest(BaseModel):
             raise ValueError("不能为空字符串")
         return v
 
+    @field_validator("occurred_at")
+    @classmethod
+    def _normalize_dt(cls, v: datetime) -> datetime:
+        return _to_utc(v)
+
+
+class AdjudicateRequest(AdjudicationSample):
+    version: Optional[int] = Field(None, description="可选版本；省略则取请求开始时最新版本")
+
     @field_validator("version", mode="before")
     @classmethod
     def _reject_bool_version(cls, v):
@@ -88,7 +98,21 @@ class AdjudicateRequest(BaseModel):
             raise ValueError("版本必须是整数，不能是布尔值")
         return v
 
-    @field_validator("occurred_at")
+
+class PreviewRequest(BaseModel):
+    """发布预览：待发布的完整候选规则集 + 按顺序排列的裁决样例。"""
+
+    rules: list[RuleIn] = Field(..., description="待发布的完整候选规则集（全量）")
+    samples: list[AdjudicationSample] = Field(
+        ..., description="裁决样例，按输入顺序逐一在基准版本与候选集上裁决"
+    )
+    base_version: Optional[int] = Field(
+        None, description="基准版本；省略则取请求开始时最新已发布版本"
+    )
+
+    @field_validator("base_version", mode="before")
     @classmethod
-    def _normalize_dt(cls, v: datetime) -> datetime:
-        return _to_utc(v)
+    def _reject_bool_base_version(cls, v):
+        if isinstance(v, bool):
+            raise ValueError("基准版本必须是整数，不能是布尔值")
+        return v

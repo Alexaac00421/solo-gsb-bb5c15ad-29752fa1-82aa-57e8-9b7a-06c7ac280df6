@@ -2,7 +2,8 @@
 
 基于 **Python 3.12 + FastAPI + PostgreSQL** 的政策/规则裁决服务。每次发布提交
 **完整规则集**，成功后得到一个**单调递增的新版本号**；裁决在固定版本内按
-**数值最高优先级**返回结论。提供可调用的 HTTP API 与调用示例，Docker Compose
+**数值最高优先级**返回结论；发布前可用**预览**接口对比候选规则集与基准版本的
+逐样例裁决差异。提供可调用的 HTTP API 与调用示例，Docker Compose
 一键启动服务和数据库并完成初始化。
 
 ---
@@ -182,12 +183,74 @@ uvicorn app.main:app --reload --port 8000
 }
 ```
 
-### 3.3 版本查询
+### 3.3 发布预览 `POST /api/v1/preview`
+
+提交**待发布的完整候选规则集**与**按顺序排列的裁决样例**，服务把每个样例分别在
+**基准版本**与**候选集**上裁决并对比，用于发布前评估影响。请求体：
+
+```json
+{
+  "rules": [
+    {
+      "business_key": "loan_approval",
+      "region": "BJ",
+      "category": "personal",
+      "valid_from": "2027-01-01T00:00:00Z",
+      "valid_to": null,
+      "priority": 50,
+      "conclusion": "approve_new_policy"
+    }
+  ],
+  "samples": [
+    {
+      "business_key": "loan_approval",
+      "region": "BJ",
+      "category": "personal",
+      "occurred_at": "2027-06-01T08:00:00Z"
+    }
+  ],
+  "base_version": 1
+}
+```
+
+* `base_version` 可选；省略时以**请求开始时**最新已发布版本为基准（与 3.2 相同的
+  事务快照语义，**并发发布不会改变本次基准**）。
+* 候选集沿用与发布完全相同的入参校验与冲突判定：**冲突时整次拒绝**，返回
+  `409 RULE_CONFLICT` 与冲突规则对，**不返回任何样例结果**。
+* 预览**全程只读**：不写入规则或版本，也不消耗版本号。
+
+成功响应 `200`，按输入顺序给出每个样例两侧的覆盖状态、结论、优先级：
+
+```json
+{
+  "base_version": 1,
+  "results": [
+    {
+      "index": 0,
+      "sample": {
+        "business_key": "loan_approval",
+        "region": "BJ",
+        "category": "personal",
+        "occurred_at": "2027-06-01T08:00:00+00:00"
+      },
+      "baseline":  {"covered": false, "priority": null, "conclusion": "未覆盖"},
+      "candidate": {"covered": true,  "priority": 50,   "conclusion": "approve_new_policy"},
+      "changed": true
+    }
+  ]
+}
+```
+
+* 仅**覆盖状态**或**结论**不同才标记 `changed: true`；仅优先级不同不算变化。
+* 错误约定与 3.5 一致：基准版本不存在 `404 VERSION_NOT_FOUND`；尚无任何已发布
+  版本 `409 NO_PUBLISHED_VERSION`；字段非法 `422 VALIDATION_ERROR`。
+
+### 3.4 版本查询
 
 * `GET /api/v1/versions`：全部已发布版本（版本号、规则数、发布时间）。
 * `GET /api/v1/versions/{version}`：指定版本元数据及其**完整规则集**；不存在返回 `404`。
 
-### 3.4 错误响应约定
+### 3.5 错误响应约定
 
 | 场景 | HTTP 状态码 | `error.code` |
 | --- | --- | --- |
@@ -226,6 +289,10 @@ bash examples/curl_examples.sh
 
 # （3）并发发布/裁决一致性演示（验证一次裁决不混用版本）
 python examples/concurrency_demo.py
+
+# （4）发布预览端到端示例（基准对比/变化标记/冲突整次拒绝/
+#     基准版本不存在/预览不消耗版本号，内置断言，全绿退出码为 0）
+python examples/preview_demo.py
 ```
 
 示例载荷文件：
@@ -233,7 +300,9 @@ python examples/concurrency_demo.py
 * [`examples/rules_v1.json`](examples/rules_v1.json)：v1 完整规则集；
 * [`examples/rules_v2.json`](examples/rules_v2.json)：v2 更正规则集
   （新增与旧规则半开端点相接的开放区间规则，演示“端点相接不冲突、旧版本重放不变”）；
-* [`examples/rules_conflict.json`](examples/rules_conflict.json)：必失败的冲突规则集。
+* [`examples/rules_conflict.json`](examples/rules_conflict.json)：必失败的冲突规则集；
+* [`examples/preview_request.json`](examples/preview_request.json)：发布预览请求
+  （候选规则集 + 4 个有序样例 + 指定基准版本）。
 
 ### 最小 Python 调用片段
 
@@ -270,6 +339,10 @@ print(post("http://localhost:8000/api/v1/adjudicate",
   （`f1 < t2 AND f2 < t1`，`NULL` 终点按 `infinity` 处理）。
 * **裁决事务隔离**：`REPEATABLE READ` 下第一条查询建立事务快照并确定版本，
   随后全部读取都来自同一快照；并发发布不会让一次裁决混用版本。
+* **发布预览只读**：候选规则集不入库——冲突预检复用发布的内存检测，候选侧裁决
+  在内存中按与 `_MATCH_SQL` 完全一致的语义（通配、半开区间、最高优先级）计算，
+  基准侧复用同一份裁决查询；全程不触碰序列，预览不会留下数据也不会消耗版本号，
+  `REPEATABLE READ` 快照保证并发发布不会改变一次预览的基准版本。
 * **最高优先级**：匹配规则按 `priority DESC` 取出，Python 侧切出最高优先级的
   全部命中规则；该优先级上结论必然唯一（否则发布时即冲突）。
 * **时区**：数据库统一使用 `TIMESTAMPTZ`；响应中的时间均为 ISO8601（UTC，带偏移）。
@@ -283,10 +356,10 @@ print(post("http://localhost:8000/api/v1/adjudicate",
 │   ├── config.py          # 环境变量配置
 │   ├── db.py              # 异步引擎、DDL 初始化、序列
 │   ├── schemas.py         # Pydantic 模型与入参校验（含半开区间校验）
-│   ├── services.py        # 发布/冲突检测/裁决/版本查询（SQL 与事务逻辑）
+│   ├── services.py        # 发布/冲突检测/裁决/发布预览/版本查询（SQL 与事务逻辑）
 │   └── main.py            # FastAPI 应用、路由与错误处理
 ├── db/init.sql            # PostgreSQL 容器首启初始化脚本
-├── examples/              # 调用示例（demo_client / curl / 并发演示 / 载荷）
+├── examples/              # 调用示例（demo_client / preview_demo / curl / 并发演示 / 载荷）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

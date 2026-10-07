@@ -3,6 +3,7 @@
 接口：
   POST /api/v1/publish      全量发布规则集（成功返回新版本号）
   POST /api/v1/adjudicate   政策裁决
+  POST /api/v1/preview      发布预览（候选规则集 vs 基准版本，逐样例对比）
   GET  /api/v1/versions     已发布版本列表
   GET  /api/v1/versions/{v} 指定版本的完整规则集
   GET  /healthz             存活探针（不查库）
@@ -19,7 +20,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .db import engine, init_db
-from .schemas import AdjudicateRequest, PublishRequest
+from .schemas import AdjudicateRequest, PreviewRequest, PublishRequest
 from .services import (
     NoPublishedVersion,
     RuleConflict,
@@ -27,6 +28,7 @@ from .services import (
     adjudicate,
     get_version,
     list_versions,
+    preview_rules,
     publish_rules,
 )
 
@@ -65,7 +67,7 @@ def _error(code: str, message: str, status: int, **extra) -> JSONResponse:
 async def _rule_conflict_handler(request: Request, exc: RuleConflict):
     return _error(
         "RULE_CONFLICT",
-        "发布失败：存在同业务键、同优先级、不同结论且可同时命中的规则",
+        f"{exc.action}失败：存在同业务键、同优先级、不同结论且可同时命中的规则",
         409,
         conflicts=exc.pairs,
     )
@@ -127,6 +129,23 @@ async def do_adjudicate(payload: AdjudicateRequest):
             category=payload.category,
             occurred_at=payload.occurred_at,
             version=payload.version,
+        )
+    return result
+
+
+@app.post("/api/v1/preview")
+async def do_preview(payload: PreviewRequest):
+    """发布预览：候选规则集 vs 基准版本，按输入顺序逐样例对比裁决。
+
+    候选集先过与发布完全相同的冲突预检（冲突则整次拒绝，不返回任何
+    样例结果）；基准版本未指定时固定为请求开始时最新已发布版本，
+    REPEATABLE READ 快照保证并发发布不会改变本次基准；全程只读，
+    不写入规则/版本，也不消耗版本号。
+    """
+    async with engine.connect() as conn:
+        await conn.execution_options(isolation_level="REPEATABLE READ")
+        result = await preview_rules(
+            conn, payload.rules, payload.samples, payload.base_version
         )
     return result
 

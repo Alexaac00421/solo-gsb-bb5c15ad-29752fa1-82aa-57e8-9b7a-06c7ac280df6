@@ -1,6 +1,6 @@
-"""业务逻辑：全量发布（含冲突检测）、裁决、版本查询。
+"""业务逻辑：全量发布（含冲突检测）、裁决、发布预览、版本查询。
 
-冲突定义（整次发布失败）：
+冲突定义（整次发布/预览失败）：
 两条规则满足全部条件即构成冲突——
   * 同一业务键；
   * 同一优先级；
@@ -18,14 +18,15 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from .config import WILDCARD
-from .schemas import RuleIn
+from .schemas import AdjudicationSample, RuleIn
 
 # ---------------------------------------------------------------- 异常
 
 class RuleConflict(Exception):
-    def __init__(self, pairs: list[dict[str, Any]]):
-        super().__init__("规则冲突，发布失败")
+    def __init__(self, pairs: list[dict[str, Any]], action: str = "发布"):
+        super().__init__(f"规则冲突，{action}失败")
         self.pairs = pairs
+        self.action = action
 
 
 class VersionNotFound(Exception):
@@ -303,6 +304,25 @@ async def match_rules(
     return [_rule_dict(row) for row in rows]
 
 
+def summarize_hits(hits: list[dict[str, Any]]) -> dict[str, Any]:
+    """从按优先级降序排列的命中规则提炼 覆盖状态/结论/优先级。
+
+    基准侧（库中规则）与候选侧（内存规则）共用；同一最高优先级上结论
+    必然唯一——否则发布/预览的冲突预检已经拒绝了该规则集。
+    """
+    if not hits:
+        return {"covered": False, "priority": None, "conclusion": "未覆盖"}
+    top_priority = hits[0]["priority"]
+    conclusions = sorted(
+        {h["conclusion"] for h in hits if h["priority"] == top_priority}
+    )
+    return {
+        "covered": True,
+        "priority": top_priority,
+        "conclusion": conclusions[0],
+    }
+
+
 async def adjudicate(
     conn: AsyncConnection,
     business_key: str,
@@ -315,26 +335,92 @@ async def adjudicate(
     hits = await match_rules(
         conn, used_version, business_key, region, category, occurred_at
     )
-    if not hits:
-        return {
-            "version": used_version,
-            "covered": False,
-            "priority": None,
-            "conclusion": "未覆盖",
-            "matched_rules": [],
-        }
-    top_priority = hits[0]["priority"]  # SQL 已按 priority DESC 排序
-    top_hits = [h for h in hits if h["priority"] == top_priority]
-    conclusions = sorted({h["conclusion"] for h in top_hits})
+    summary = summarize_hits(hits)
+    top_hits = [h for h in hits if h["priority"] == summary["priority"]] if hits else []
     # 同一最高优先级多条命中：发布时已保证同优先级不同结论不可能同时命中，
-    # 因此这里结论必然唯一；多条规则给同一结论时返回该结论及全部命中规则。
+    # 因此结论必然唯一；多条规则给同一结论时返回该结论及全部命中规则。
     return {
         "version": used_version,
-        "covered": True,
-        "priority": top_priority,
-        "conclusion": conclusions[0],
+        **summary,
         "matched_rules": top_hits,
     }
+
+
+# ---------------------------------------------------------------- 发布预览
+
+def _candidate_hits(
+    rules: list[RuleIn], sample: AdjudicationSample
+) -> list[dict[str, Any]]:
+    """候选规则集（未入库）的内存匹配，语义与 _MATCH_SQL 完全一致。
+
+    通配 '*' 对应库中的 NULL；排序对应 ORDER BY priority DESC, id——
+    稳定排序使同优先级保持输入顺序（即写入库后会得到的 id 顺序）。
+    """
+    hits = [
+        {"priority": r.priority, "conclusion": r.conclusion}
+        for r in rules
+        if r.business_key == sample.business_key
+        and (r.region == WILDCARD or r.region == sample.region)
+        and (r.category == WILDCARD or r.category == sample.category)
+        and r.valid_from <= sample.occurred_at
+        and (r.valid_to is None or r.valid_to > sample.occurred_at)
+    ]
+    hits.sort(key=lambda h: h["priority"], reverse=True)
+    return hits
+
+
+async def preview_rules(
+    conn: AsyncConnection,
+    rules: list[RuleIn],
+    samples: list[AdjudicationSample],
+    base_version: Optional[int],
+) -> dict[str, Any]:
+    """发布预览：候选规则集与基准版本逐样例对比裁决。
+
+    * 候选集先做与发布完全相同的内存冲突预检，冲突即整次拒绝，
+      不返回任何样例结果；
+    * 基准版本在调用方建立的 REPEATABLE READ 快照内解析，并发发布
+      不会改变本次基准；
+    * 全程只读：不写入规则或版本，也不消耗版本号。
+    """
+    conflicts = find_conflicts(rules)
+    if conflicts:
+        raise RuleConflict(conflicts, action="预览")
+
+    used_base = await resolve_version(conn, base_version)
+
+    results: list[dict[str, Any]] = []
+    for index, sample in enumerate(samples):
+        baseline = summarize_hits(
+            await match_rules(
+                conn,
+                used_base,
+                sample.business_key,
+                sample.region,
+                sample.category,
+                sample.occurred_at,
+            )
+        )
+        candidate = summarize_hits(_candidate_hits(rules, sample))
+        results.append(
+            {
+                "index": index,
+                "sample": {
+                    "business_key": sample.business_key,
+                    "region": sample.region,
+                    "category": sample.category,
+                    "occurred_at": sample.occurred_at,
+                },
+                "baseline": baseline,
+                "candidate": candidate,
+                # 仅覆盖状态或结论不同才标记为变化（优先级差异本身不算）
+                "changed": (
+                    baseline["covered"] != candidate["covered"]
+                    or baseline["conclusion"] != candidate["conclusion"]
+                ),
+            }
+        )
+    return {"base_version": used_base, "results": results}
 
 
 # ---------------------------------------------------------------- 版本查询
