@@ -1,0 +1,40 @@
+{
+  "rules": [
+    {
+      "business_key": "loan_approval",
+      "region": "BJ",
+      "category": "personal",
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_to": "2027-01-01T00:00:00Z",
+      "priority": 100,
+      "conclusion": "approve"
+    },
+    {
+      "business_key": "loan_approval",
+      "region": "SH",
+      "category": "personal",
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_to": "2027-01-01T00:00:00Z",
+      "priority": 100,
+      "conclusion": "reject"
+    },
+    {
+      "business_key": "loan_approval",
+      "region": "*",
+      "category": "*",
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_to": "2027-01-01T00:00:00Z",
+      "priority": 10,
+      "conclusion": "manual_review"
+    },
+    {
+      "business_key": "loan_approval",
+      "region": "BJ",
+      "category": "personal",
+      "valid_from": "2027-01-01T00:00:00Z",
+      "valid_to": null,
+      "priority": 50,
+      "conclusion": "approve_new_policy"
+    }
+  ]
+}
