@@ -1,0 +1,22 @@
+{
+  "rules": [
+    {
+      "business_key": "loan_approval",
+      "region": "BJ",
+      "category": "personal",
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_to": null,
+      "priority": 100,
+      "conclusion": "approve"
+    }
+  ],
+  "samples": [
+    {
+      "business_key": "loan_approval",
+      "region": "BJ",
+      "category": "personal",
+      "occurred_at": "2026-06-01T08:00:00Z"
+    }
+  ],
+  "version": 999
+}

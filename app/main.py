@@ -2,6 +2,7 @@
 
 接口：
   POST /api/v1/publish      全量发布规则集（成功返回新版本号）
+  POST /api/v1/preview      发布预览（不写入、不消耗版本号，返回基准/候选双侧裁决对比）
   POST /api/v1/adjudicate   政策裁决
   GET  /api/v1/versions     已发布版本列表
   GET  /api/v1/versions/{v} 指定版本的完整规则集
@@ -19,7 +20,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .db import engine, init_db
-from .schemas import AdjudicateRequest, PublishRequest
+from .schemas import AdjudicateRequest, PreviewRequest, PublishRequest
 from .services import (
     NoPublishedVersion,
     RuleConflict,
@@ -27,6 +28,7 @@ from .services import (
     adjudicate,
     get_version,
     list_versions,
+    preview_publish,
     publish_rules,
 )
 
@@ -47,6 +49,7 @@ app = FastAPI(
     version="1.0.0",
     description=(
         "全量发布规则集（同业务键同优先级不同结论存在同时命中即发布失败），"
+        "发布预览（候选集不写入，对比基准版本与候选集在样例上的裁决差异），"
         "按业务键/地区/类别/时刻在固定版本内裁决。"
     ),
     lifespan=lifespan,
@@ -106,6 +109,28 @@ async def publish(payload: PublishRequest):
         version, count = await publish_rules(conn, payload.rules)
     logger.info("发布成功：version=%s, rules=%s", version, count)
     return {"version": version, "rule_count": count}
+
+
+@app.post("/api/v1/preview")
+async def preview(payload: PreviewRequest):
+    """发布预览：候选规则集不写入，按基准版本与候选集分别裁决每条样例。
+
+    冲突判定与发布完全一致，候选集冲突时整次拒绝（409，返回冲突规则对），
+    不产生任何部分样例结果。基准版本未指定时固定为请求开始时最新已发布版本；
+    REPEATABLE READ 保证整次预览只用该版本，即使期间有并发发布提交。
+    预览不写入规则/版本，也不消耗版本号。
+    """
+    # 与 /adjudicate 相同的隔离用法：快照在第一条读语句建立后固定，
+    # 基准版本随后不会被并发发布改变
+    async with engine.connect() as conn:
+        await conn.execution_options(isolation_level="REPEATABLE READ")
+        result = await preview_publish(
+            conn,
+            rules=payload.rules,
+            samples=payload.samples,
+            version=payload.version,
+        )
+    return result
 
 
 @app.post("/api/v1/adjudicate")

@@ -60,6 +60,30 @@ curl -sS -o /tmp/notfound.json -w 'HTTP %{http_code}\n' -X POST "$BASE_URL/api/v
 cat /tmp/notfound.json; echo
 
 echo
-echo "7) 版本列表 / 指定版本规则集"
+echo "7) 发布预览：候选集不写入，对比基准（最新版 v1）与候选在每条样例上的裁决"
+curl -fsS -X POST "$BASE_URL/api/v1/preview" \
+  -H 'Content-Type: application/json' \
+  -d @"$(dirname "$0")/preview_request.json"; echo
+
+echo
+echo "7a) 预览冲突候选集（HTTP 409，整次拒绝、不返回样例结果，不产生版本）"
+curl -sS -o /tmp/preview_conflict.json -w 'HTTP %{http_code}\n' -X POST "$BASE_URL/api/v1/preview" \
+  -H 'Content-Type: application/json' \
+  -d @"$(dirname "$0")/preview_conflict.json"
+cat /tmp/preview_conflict.json; echo
+
+echo
+echo "7b) 预览指定不存在的基准版本（HTTP 404）"
+curl -sS -o /tmp/preview_notfound.json -w 'HTTP %{http_code}\n' -X POST "$BASE_URL/api/v1/preview" \
+  -H 'Content-Type: application/json' \
+  -d @"$(dirname "$0")/preview_bad_version.json"
+cat /tmp/preview_notfound.json; echo
+
+echo
+echo "7c) 预览后版本列表不变（未写入、未消耗版本号）"
+curl -fsS "$BASE_URL/api/v1/versions"; echo
+
+echo
+echo "8) 版本列表 / 指定版本规则集"
 curl -fsS "$BASE_URL/api/v1/versions"; echo
 curl -fsS "$BASE_URL/api/v1/versions/1" | head -c 600; echo

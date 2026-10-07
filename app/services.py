@@ -18,7 +18,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from .config import WILDCARD
-from .schemas import RuleIn
+from .schemas import PreviewSample, RuleIn
 
 # ---------------------------------------------------------------- 异常
 
@@ -272,7 +272,7 @@ async def resolve_version(conn: AsyncConnection, version: Optional[int]) -> int:
     """version 为 None 时取当前事务快照内可见的最新已发布版本。
 
     调用方使用 REPEATABLE READ：快照在第一条语句时固定，
-    因此并发提交的新版本不会被本次裁决随后看到——裁决全程只使用一个版本。
+    因此并发提交的新版本不会被本次请求随后看到——全程只使用一个版本。
     """
     row = (
         await conn.execute(_RESOLVE_VERSION_SQL, {"version": version})
@@ -303,6 +303,32 @@ async def match_rules(
     return [_rule_dict(row) for row in rows]
 
 
+def decide_from_hits(hits: list[dict[str, Any]]) -> dict[str, Any]:
+    """从一组已按 priority DESC 排序的命中规则中取最高优先级结论。
+
+    数据库（_MATCH_SQL）与候选集内存匹配（_match_rules_in_memory）
+    共用此函数，保证两侧“最高优先级规则裁决”语义完全一致。
+    同一最高优先级多条命中：发布时已保证同优先级不同结论不可能同时命中，
+    因此这里结论必然唯一；多条规则给同一结论时返回全部命中规则。
+    """
+    if not hits:
+        return {
+            "covered": False,
+            "priority": None,
+            "conclusion": "未覆盖",
+            "matched_rules": [],
+        }
+    top_priority = hits[0]["priority"]
+    top_hits = [h for h in hits if h["priority"] == top_priority]
+    conclusions = sorted({h["conclusion"] for h in top_hits})
+    return {
+        "covered": True,
+        "priority": top_priority,
+        "conclusion": conclusions[0],
+        "matched_rules": top_hits,
+    }
+
+
 async def adjudicate(
     conn: AsyncConnection,
     business_key: str,
@@ -315,25 +341,133 @@ async def adjudicate(
     hits = await match_rules(
         conn, used_version, business_key, region, category, occurred_at
     )
-    if not hits:
-        return {
-            "version": used_version,
-            "covered": False,
-            "priority": None,
-            "conclusion": "未覆盖",
-            "matched_rules": [],
-        }
-    top_priority = hits[0]["priority"]  # SQL 已按 priority DESC 排序
-    top_hits = [h for h in hits if h["priority"] == top_priority]
-    conclusions = sorted({h["conclusion"] for h in top_hits})
-    # 同一最高优先级多条命中：发布时已保证同优先级不同结论不可能同时命中，
-    # 因此这里结论必然唯一；多条规则给同一结论时返回该结论及全部命中规则。
+    result = decide_from_hits(hits)
+    return {"version": used_version, **result}
+
+
+# ---------------------------------------------------------------- 发布预览
+
+def _rule_as_dict(rule: RuleIn) -> dict[str, Any]:
+    """候选规则的内部表示：地区/类别通配归一为 None（与库中存储一致）。"""
     return {
-        "version": used_version,
-        "covered": True,
-        "priority": top_priority,
-        "conclusion": conclusions[0],
-        "matched_rules": top_hits,
+        "business_key": rule.business_key,
+        "region": _present_region(rule.region),
+        "category": _present_category(rule.category),
+        "valid_from": rule.valid_from,
+        "valid_to": rule.valid_to,
+        "priority": rule.priority,
+        "conclusion": rule.conclusion,
+    }
+
+
+def _match_rules_in_memory(
+    rules: list[dict[str, Any]],
+    business_key: str,
+    region: str,
+    category: str,
+    occurred_at: datetime,
+) -> list[dict[str, Any]]:
+    """在候选规则集（内存）内做与 _MATCH_SQL 完全一致的匹配。
+
+    命中条件：业务键相等；地区/类别相等或规则一侧为通配（None）；
+    半开区间 [valid_from, valid_to) 覆盖 occurred_at
+    （valid_from <= t，valid_to 为空或 > t）。
+    返回按 priority DESC 排序的命中规则（候选规则无库内 id，不含 id）。
+    """
+    hits: list[dict[str, Any]] = []
+    for rule in rules:
+        if rule["business_key"] != business_key:
+            continue
+        if rule["region"] is not None and rule["region"] != region:
+            continue
+        if rule["category"] is not None and rule["category"] != category:
+            continue
+        if rule["valid_from"] > occurred_at:
+            continue
+        if rule["valid_to"] is not None and rule["valid_to"] <= occurred_at:
+            continue
+        hits.append(rule)
+    hits.sort(key=lambda r: r["priority"], reverse=True)
+    return hits
+
+
+def _preview_side(hits: list[dict[str, Any]]) -> dict[str, Any]:
+    """预览结果单侧（基准/候选）对外字段：覆盖状态、结论、优先级。
+
+    按需求仅回传 covered/conclusion/priority，不回传命中规则明细。
+    """
+    decision = decide_from_hits(hits)
+    return {
+        "covered": decision["covered"],
+        "conclusion": decision["conclusion"],
+        "priority": decision["priority"],
+    }
+
+
+async def preview_publish(
+    conn: AsyncConnection,
+    rules: list[RuleIn],
+    samples: list[PreviewSample],
+    version: Optional[int],
+) -> dict[str, Any]:
+    """待发布候选规则集的发布预览（不写入、不消耗版本号）。
+
+    1) 先在请求开始时的事务快照内固定基准版本：指定版本不存在 ->
+       VersionNotFound；未指定且尚无发布 -> NoPublishedVersion；
+    2) 沿用发布的冲突判定对候选集预检，冲突即抛 RuleConflict，
+       整次拒绝、不产生任何样例结果；
+    3) 每条样例分别在基准版本与候选集上按通配、半开时间段、最高优先级裁决，
+       按输入顺序返回两侧覆盖状态/结论/优先级；
+       仅覆盖状态或结论不同标记 changed=true（优先级变化不单独标记）。
+    """
+    used_version = await resolve_version(conn, version)
+
+    conflicts = find_conflicts(rules)
+    if conflicts:
+        raise RuleConflict(conflicts)
+
+    candidate_rules = [_rule_as_dict(r) for r in rules]
+
+    results: list[dict[str, Any]] = []
+    for index, sample in enumerate(samples):
+        baseline_hits = await match_rules(
+            conn,
+            used_version,
+            sample.business_key,
+            sample.region,
+            sample.category,
+            sample.occurred_at,
+        )
+        candidate_hits = _match_rules_in_memory(
+            candidate_rules,
+            sample.business_key,
+            sample.region,
+            sample.category,
+            sample.occurred_at,
+        )
+        baseline = _preview_side(baseline_hits)
+        candidate = _preview_side(candidate_hits)
+        changed = (
+            baseline["covered"] != candidate["covered"]
+            or baseline["conclusion"] != candidate["conclusion"]
+        )
+        results.append(
+            {
+                "index": index,
+                "business_key": sample.business_key,
+                "region": sample.region,
+                "category": sample.category,
+                "occurred_at": sample.occurred_at,
+                "baseline": baseline,
+                "candidate": candidate,
+                "changed": changed,
+            }
+        )
+
+    return {
+        "baseline_version": used_version,
+        "candidate_rule_count": len(candidate_rules),
+        "samples": results,
     }
 
 
